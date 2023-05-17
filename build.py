@@ -22,7 +22,7 @@ def _parse_args():
     args.add_argument(
         "--quantization-mode", type=str, choices=["int4", "int3", "fp4"], default="int4"
     )
-    args.add_argument("--pre-quantized", type=str, choices=[None, "GPTQ"], default=None)
+    args.add_argument("--pre-quantized", type=str, default=None, help="Filename of the prequantized model")
     args.add_argument(
         "--quantization-storage-nbit", type=int, choices=[32, 16], default=32
     )
@@ -215,6 +215,7 @@ def mod_transform_before_build(
     model_names = ["encoding", "decoding", "create_kv_cache"]
 
     if not args.no_quantize:
+        import ipdb; ipdb.set_trace()
         mod = mlc_llm.transform.GroupQuantize(
             group_size=40 if args.quantization_mode.endswith("3") else 32,
             sym=args.quantization_sym,

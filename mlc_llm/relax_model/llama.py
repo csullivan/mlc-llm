@@ -671,7 +671,23 @@ def get_model(args):
         import ipdb; ipdb.set_trace()
 
         if model_name == "llama-65b":
+            if args.pre_quantized:
+                preq_model_path = model_path + "/" + args.pre_quantized
+                with Timer(f"Loading state from {preq_model_path}"):
+                    state_dict = torch.load(preq_model_path)
             hf_config = HFLlamaConfig.from_pretrained(model_path)
+            wbits = int(
+                (
+                    32
+                    * state_dict["model.layers.1.self_attn.v_proj.qweight"].shape[0]
+                )
+                / config.hidden_size
+            )
+
+            groupsize = (
+                (state_dict["model.layers.1.mlp.down_proj.g_idx"] == 0).sum().item()
+            )
+
             def noop(*args, **kwargs):
                 pass
 
