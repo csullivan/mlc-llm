@@ -51,6 +51,16 @@ class LlamaConfig:
 MODEL_CONFIG = {
     "vicuna-v1-7b": {},
     "llama-7b": {},
+    "llama-65b": {
+        "hidden_size": 8192,
+        "intermediate_size": 22016,
+        "num_hidden_layers": 80,
+        "num_attention_heads": 64,
+        "rms_norm_eps": 1e-05,
+        "pad_token_id": 0,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+    }
 }
 
 
@@ -633,7 +643,10 @@ def create_kv_cache_func(bb: relax.BlockBuilder, config: LlamaConfig) -> None:
 
 
 def get_model(args):
-    from transformers import AutoModelForCausalLM  # type: ignore[import]
+    import torch, transformers
+    from transformers import AutoModelForCausalLM, LlamaForCausalLM  # type: ignore[import]
+    from transformers import LlamaConfig as HFLlamaConfig # type: ignore[import]
+
 
     model_name = args.model
     model_path = args.model_path
@@ -653,7 +666,24 @@ def get_model(args):
 
         param_list = []
         device = tvm.cpu()
-        hf_model = AutoModelForCausalLM.from_pretrained(model_path)
+        import ipdb; ipdb.set_trace()
+
+        if model_name == "llama-65b":
+            hf_config = HFLlamaConfig.from_pretrained(model_path)
+            def noop(*args, **kwargs):
+                pass
+
+            torch.nn.init.kaiming_uniform_ = noop
+            torch.nn.init.uniform_ = noop
+            torch.nn.init.normal_ = noop
+
+            transformers.modeling_utils._init_weights = False
+
+            torch.set_default_dtype(torch.half)
+            hf_model = LlamaForCausalLM(hf_config)
+            torch.set_default_dtype(torch.float)
+        else:
+            hf_model = AutoModelForCausalLM.from_pretrained(model_path)
         for _, param in hf_model.named_parameters():
             param_list.append(
                 tvm.nd.array(param.detach().cpu().numpy().astype(config.dtype), device)

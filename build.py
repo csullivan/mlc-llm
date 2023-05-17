@@ -22,6 +22,7 @@ def _parse_args():
     args.add_argument(
         "--quantization-mode", type=str, choices=["int4", "int3", "fp4"], default="int4"
     )
+    args.add_argument("--pre-quantized", type=str, choices=[None, "GPTQ"], default=None)
     args.add_argument(
         "--quantization-storage-nbit", type=int, choices=[32, 16], default=32
     )

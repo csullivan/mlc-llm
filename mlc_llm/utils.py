@@ -20,6 +20,7 @@ def argparse_add_common(args: argparse.ArgumentParser) -> None:
             "dolly-v2-12b",
             "stablelm-tuned-alpha-3b",
             "stablelm-tuned-alpha-7b",
+            "llama-65b",
         ],
     )
     args.add_argument(
