@@ -10,7 +10,8 @@ from tvm import relax
 from tvm.relax.backend.pattern_registry import get_pattern
 
 import mlc_llm
-from mlc_llm import utils, Timer
+from mlc_llm import utils
+from mlc_llm.timer import Timer
 from mlc_llm.relax_model import gpt_neox, llama
 from mlc_llm.transform import rewrite_attention
 

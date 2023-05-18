@@ -8,7 +8,7 @@ from tvm import relax, te
 from tvm.relax.testing import nn
 from tvm.script import relax as R
 
-from mlc_llm import Timer
+from mlc_llm.timer import Timer
 
 
 @dataclass
