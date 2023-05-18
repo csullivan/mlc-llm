@@ -676,6 +676,7 @@ def get_model(args):
                 with Timer(f"Loading state from {preq_model_path}"):
                     state_dict = torch.load(preq_model_path)
             hf_config = HFLlamaConfig.from_pretrained(model_path)
+            import ipdb; ipdb.set_trace()
             wbits = int(
                 (
                     32
@@ -700,6 +701,10 @@ def get_model(args):
             torch.set_default_dtype(torch.half)
             hf_model = LlamaForCausalLM(hf_config)
             torch.set_default_dtype(torch.float)
+            hf_model = hf_model.eval()
+            with Timer(f"Applying weights state dictionary"):
+                hf_model.load_state_dict(state_dict, strict=False)
+
         else:
             hf_model = AutoModelForCausalLM.from_pretrained(model_path)
         for _, param in hf_model.named_parameters():
