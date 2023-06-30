@@ -4,6 +4,7 @@ import json
 import os
 import pickle
 from typing import Any, Callable, Dict, List, Optional, Tuple
+import graphviz
 
 import tvm
 from tvm import meta_schedule as ms
@@ -18,6 +19,9 @@ from mlc_llm.transform import combine_parallel_transposed_matmul, fuse_split_rot
 
 def _parse_args():
     args = argparse.ArgumentParser()
+    args.add_argument(
+        "--plot", default=False, action="store_true",
+    )
     args.add_argument(
         "--model",
         type=str,
@@ -392,6 +396,101 @@ from tvm.script import tir as T
     with open(dynamic_path, "w", encoding="utf-8") as o_f:
         o_f.write(template.format(content=mod_dynamic.script()))
 
+@relax.expr_functor.visitor
+class DataFlowGraphvizGenerator(tvm.relax.PyExprVisitor):
+    def __init__(self, mod: tvm.IRModule) -> None:
+        self.mod_ = mod
+        self.dot = graphviz.Digraph(comment='Data Flow')
+        # self.dot = graphviz.Digraph(comment='Data Flow', engine='neato')
+        #self.dot.attr(rankdir='LR', size='16,12', overlap='false', nodesep='1', ranksep='2') 
+        self.counter = 0
+        self.ids = {}
+        self.bindings = {}
+
+    def transform(self, func_name=None) -> str:
+        # Step 1. Iterate over all functions in the IRModulev
+        for global_var, func in self.mod_.functions.items():
+            # Skip non-relax functions
+            if not isinstance(func, relax.Function):
+                continue
+            if func_name == global_var.name_hint:
+                self.visit_expr(func)
+
+        # Return the string representation of the graph.
+        return self.dot.source
+
+    def visit_var_binding_(self, binding: relax.VarBinding) -> None:
+        self.bindings[binding.var] = binding.value
+        super().visit_var_binding_(binding)
+    
+    # def visit_tuple_getitem_(self, tuple_getitem : relax.TupleGetItem):
+    #     super().visit_expr(tuple_getitem)
+    #     if self.ids[str(tuple_getitem.tuple_value)] in self.ids:
+    #         print("after:", tuple_getitem.tuple_value)
+    #         self.ids[str(tuple_getitem)] = self.ids[str(tuple_getitem.tuple_value)]
+        
+    # def visit_var_(self, var_node: relax.Var):
+    #     unique_id = str(self.counter)
+    #     self.counter += 1
+    #     self.ids[str(var_node)] = unique_id
+
+    def visit_call_(self, call_node: relax.Call):        
+        unique_id = str(self.counter)
+        self.counter += 1  # Increment the counter.
+
+        # For each argument in call_node, create an edge from argument to call_node
+        args = []
+        if call_node.op == tvm.ir.Op.get("relax.call_tir"):
+            op_name = call_node.args[0].name_hint
+            args = call_node.args[1]
+        elif call_node.op == tvm.ir.Op.get("relax.call_dps_packed"):
+            # TODO test the correctness
+
+            op_name = call_node.args[0].name_hint
+            args = call_node.args[1]
+        elif isinstance(call_node.op, relax.expr.ExternFunc):
+            op_name = call_node.op.global_symbol
+            args = call_node.args
+        else:
+            op_name = call_node.op.name
+            args = call_node.args
+            
+        self.dot.node(unique_id, op_name, fontsize='10')  # set fontsize to '10'
+        self.ids[str(call_node)] = unique_id
+        
+        
+        for arg in args:
+            if isinstance(arg, relax.DataflowVar):
+                arg = self.bindings[arg]
+                # TODO visit
+                super().visit_call_(arg)
+                
+                if isinstance(arg, relax.expr.TupleGetItem):
+                    arg = arg.tuple_value
+                    self.dot.node(str(self.counter), arg.name_hint, fontsize='10')  
+                    self.dot.edge(str(self.counter), unique_id)
+                    self.counter += 1
+                    continue
+                
+                try:
+                    self.dot.edge(self.ids[str(arg)], unique_id)
+                except:
+                    import ipdb; ipdb.set_trace()
+                    print(type(arg))
+            elif isinstance(arg, relax.Var):
+                # self.dot.node(self.ids[str(arg)], arg.name_hint, fontsize='10')  
+                # self.dot.edge(unique_id, self.ids[str(arg)])
+                self.dot.node(str(self.counter), arg.name_hint, fontsize='10')  
+                self.dot.edge(str(self.counter), unique_id)
+                self.counter += 1
+            elif isinstance(arg, relax.expr.Constant):
+                self.dot.node(str(self.counter), str(arg), fontsize='10')  
+                self.dot.edge(str(self.counter), unique_id)
+                self.counter += 1                
+            # else:
+                # import ipdb; ipdb.set_trace()
+            
+        
 
 def main():
     os.makedirs(ARGS.artifact_path, exist_ok=True)
@@ -414,6 +513,16 @@ def main():
                 mod, params = rwkv.get_model(ARGS, config)
             else:
                 raise ValueError(f"Model {ARGS.model} not supported")
+            if ARGS.plot:
+                visitor = DataFlowGraphvizGenerator(mod)
+                dot_source = visitor.transform("decode")
+                with open("llama.dot", "w") as f:
+                    f.write(dot_source)
+
+                src = graphviz.Source(dot_source)
+                src.render(filename="llama", format="pdf")
+                import ipdb; ipdb.set_trace()
+
             mod = mod_transform_before_build(mod, params, ARGS)
             # print(mod.without_attr("external_mods").without_attr("const_name_to_constant"))
 
