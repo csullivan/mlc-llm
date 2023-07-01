@@ -397,8 +397,88 @@ from tvm.script import tir as T
         o_f.write(template.format(content=mod_dynamic.script()))
 
 @relax.expr_functor.visitor
-class DataFlowGraphvizGenerator(tvm.relax.PyExprVisitor):
+class CallNodeTopologicalSorter(tvm.relax.PyExprVisitor):
     def __init__(self, mod: tvm.IRModule) -> None:
+        self.mod_ = mod
+        self.visited = set()
+        self.sorted_call_nodes = []
+        self.bindings = {}
+    def calculate_distance(self, element1, element2):
+        """
+        Calculates the distance between two elements in a list.
+        If one or both elements are not in the list, it raises a ValueError.
+
+        Parameters:
+        lst (list): The list in which to find the elements.
+        element1: The first element.
+        element2: The second element.
+
+        Returns:
+        int: The distance between the two elements in the list.
+        """
+        lst = self.sorted_call_nodes
+
+        # print("Calculate distance for: ", element1, element2)
+        if element1 not in lst or element2 not in lst:
+            return 1000000000
+
+        # Find the indices of the elements
+        index1 = lst.index(element1)
+        index2 = lst.index(element2)
+
+        # Return the absolute difference of the indices
+        distance = abs(index1 - index2)
+
+        return distance
+
+    def transform(self, func_name=None) -> list:
+        # Step 1. Iterate over all functions in the IRModule
+        for global_var, func in self.mod_.functions.items():
+            # Skip non-relax functions
+            if not isinstance(func, relax.Function):
+                continue
+            if func_name == global_var.name_hint:
+                self.visit_expr(func)
+        # No need to reverse the list because the nodes are added in post-order
+        return self.sorted_call_nodes
+    
+    def visit_var_binding_(self, binding: relax.VarBinding) -> None:
+        self.bindings[binding.var] = binding.value
+        super().visit_var_binding_(binding)
+
+    def visit_call_(self, call_node: relax.Call):
+        # For each argument in call_node, create an edge from argument to call_node
+        if call_node not in self.visited:
+            self.visited.add(call_node)
+
+            args = []
+            if call_node.op == tvm.ir.Op.get("relax.call_tir"):
+                args = call_node.args[1]
+            elif call_node.op == tvm.ir.Op.get("relax.call_dps_packed"):
+                args = call_node.args[1]
+            elif isinstance(call_node.op, relax.expr.ExternFunc):
+                args = call_node.args
+            else:
+                args = call_node.args
+                
+            
+            for arg in args:
+                if isinstance(arg, relax.DataflowVar):
+                    arg = self.bindings[arg]
+                    super().visit_call_(arg)
+                    
+                if isinstance(arg, relax.Call):
+                    super().visit_call_(arg)
+                elif isinstance(arg, relax.Var) or isinstance(arg, relax.expr.Constant):
+                    if arg not in self.visited:
+                        self.sorted_call_nodes.append(call_node)
+                    
+            # after visiting all the args of this call_node, add it to the result list.
+            self.sorted_call_nodes.append(call_node)
+
+@relax.expr_functor.visitor
+class DataFlowGraphvizGenerator(tvm.relax.PyExprVisitor):
+    def __init__(self, mod: tvm.IRModule, topo: CallNodeTopologicalSorter) -> None:
         self.mod_ = mod
         self.dot = graphviz.Digraph(comment='Data Flow')
         # self.dot = graphviz.Digraph(comment='Data Flow', engine='neato')
@@ -406,6 +486,7 @@ class DataFlowGraphvizGenerator(tvm.relax.PyExprVisitor):
         self.counter = 0
         self.ids = {}
         self.bindings = {}
+        self.topo = topo
 
     def transform(self, func_name=None) -> str:
         # Step 1. Iterate over all functions in the IRModulev
@@ -455,7 +536,7 @@ class DataFlowGraphvizGenerator(tvm.relax.PyExprVisitor):
             op_name = call_node.op.name
             args = call_node.args
             
-        self.dot.node(unique_id, op_name, fontsize='10')  # set fontsize to '10'
+        self.dot.node(unique_id, op_name, shape="box", fontsize='10')  # set fontsize to '10'
         self.ids[str(call_node)] = unique_id
         
         
@@ -467,24 +548,31 @@ class DataFlowGraphvizGenerator(tvm.relax.PyExprVisitor):
                 
                 if isinstance(arg, relax.expr.TupleGetItem):
                     arg = arg.tuple_value
-                    self.dot.node(str(self.counter), arg.name_hint, fontsize='10')  
-                    self.dot.edge(str(self.counter), unique_id)
+                    self.dot.node(str(self.counter), arg.name_hint, shape="box", fontsize='10')  
+                    
+
+                    if self.topo.calculate_distance(call_node, arg) < 100:
+                        self.dot.edge(str(self.counter), unique_id)
                     self.counter += 1
                     continue
                 
                 try:
-                    self.dot.edge(self.ids[str(arg)], unique_id)
-                except:
+                    if self.topo.calculate_distance(call_node, arg) < 100:
+                        self.dot.edge(self.ids[str(arg)], unique_id)
+                except Exception as e:
+                    print(e)
                     import ipdb; ipdb.set_trace()
                     print(type(arg))
             elif isinstance(arg, relax.Var):
                 # self.dot.node(self.ids[str(arg)], arg.name_hint, fontsize='10')  
                 # self.dot.edge(unique_id, self.ids[str(arg)])
-                self.dot.node(str(self.counter), arg.name_hint, fontsize='10')  
+                self.dot.node(str(self.counter), arg.name_hint, shape="box", fontsize='10')  
+                #if self.topo.calculate_distance(call_node, arg) < 100:
                 self.dot.edge(str(self.counter), unique_id)
                 self.counter += 1
             elif isinstance(arg, relax.expr.Constant):
-                self.dot.node(str(self.counter), str(arg), fontsize='10')  
+                self.dot.node(str(self.counter), str(arg), shape="box", fontsize='10')  
+                #if self.topo.calculate_distance(call_node, arg) < 100:
                 self.dot.edge(str(self.counter), unique_id)
                 self.counter += 1                
             # else:
@@ -514,7 +602,9 @@ def main():
             else:
                 raise ValueError(f"Model {ARGS.model} not supported")
             if ARGS.plot:
-                visitor = DataFlowGraphvizGenerator(mod)
+                visitor = CallNodeTopologicalSorter(mod)
+                visitor.transform("decode")
+                visitor = DataFlowGraphvizGenerator(mod, visitor)
                 dot_source = visitor.transform("decode")
                 with open("llama.dot", "w") as f:
                     f.write(dot_source)
