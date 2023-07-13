@@ -525,17 +525,21 @@ class DataFlowGraphvizGenerator(tvm.relax.PyExprVisitor):
             op_name = call_node.args[0].name_hint
             args = call_node.args[1]
         elif call_node.op == tvm.ir.Op.get("relax.call_dps_packed"):
-            # TODO test the correctness
+            # TODO needs better handling of arg , refactor
 
-            op_name = call_node.args[0].name_hint
-            args = call_node.args[1]
+            # op_name = call_node.args[0].name_hint
+            op_name = call_node.op.global_symbol
+            #args = call_node.args[1]
+            args = call_node.args
         elif isinstance(call_node.op, relax.expr.ExternFunc):
             op_name = call_node.op.global_symbol
             args = call_node.args
         else:
             op_name = call_node.op.name
             args = call_node.args
-            
+
+        op_name += "\n" +str(call_node) 
+        op_name += "\n" + str(call_node.struct_info)
         self.dot.node(unique_id, op_name, shape="box", fontsize='10')  # set fontsize to '10'
         self.ids[str(call_node)] = unique_id
         
@@ -548,7 +552,7 @@ class DataFlowGraphvizGenerator(tvm.relax.PyExprVisitor):
                 
                 if isinstance(arg, relax.expr.TupleGetItem):
                     arg = arg.tuple_value
-                    self.dot.node(str(self.counter), arg.name_hint, shape="box", fontsize='10')  
+                    self.dot.node(str(self.counter), arg.name_hint + "\n" + str(arg) + "\n" + str(call_node.struct_info), shape="box", fontsize='10')  
                     
 
                     if self.topo.calculate_distance(call_node, arg) < 100:
@@ -564,14 +568,12 @@ class DataFlowGraphvizGenerator(tvm.relax.PyExprVisitor):
                     import ipdb; ipdb.set_trace()
                     print(type(arg))
             elif isinstance(arg, relax.Var):
-                # self.dot.node(self.ids[str(arg)], arg.name_hint, fontsize='10')  
-                # self.dot.edge(unique_id, self.ids[str(arg)])
-                self.dot.node(str(self.counter), arg.name_hint, shape="box", fontsize='10')  
+                self.dot.node(str(self.counter), arg.name_hint + "\n" + str(arg) + "\n" + str(call_node.struct_info), shape="box", fontsize='10')  
                 #if self.topo.calculate_distance(call_node, arg) < 100:
                 self.dot.edge(str(self.counter), unique_id)
                 self.counter += 1
             elif isinstance(arg, relax.expr.Constant):
-                self.dot.node(str(self.counter), str(arg), shape="box", fontsize='10')  
+                self.dot.node(str(self.counter), str(arg) + "\n" + str(arg) + "\n" + str(call_node.struct_info), shape="box", fontsize='10')  
                 #if self.topo.calculate_distance(call_node, arg) < 100:
                 self.dot.edge(str(self.counter), unique_id)
                 self.counter += 1                
@@ -579,7 +581,16 @@ class DataFlowGraphvizGenerator(tvm.relax.PyExprVisitor):
                 # import ipdb; ipdb.set_trace()
             
         
-
+def dump_graph(name, mod, func=""):
+    visitor = CallNodeTopologicalSorter(mod)
+    visitor.transform(func)
+    visitor = DataFlowGraphvizGenerator(mod, visitor)
+    dot_source = visitor.transform(func)
+    with open(name + ".dot", "w") as f:
+        f.write(dot_source)
+    src = graphviz.Source(dot_source)
+    src.render(filename=name, format="pdf")
+    
 def main():
     os.makedirs(ARGS.artifact_path, exist_ok=True)
     os.makedirs(os.path.join(ARGS.artifact_path, "debug"), exist_ok=True)
@@ -602,16 +613,7 @@ def main():
             else:
                 raise ValueError(f"Model {ARGS.model} not supported")
             if ARGS.plot:
-                visitor = CallNodeTopologicalSorter(mod)
-                visitor.transform("decode")
-                visitor = DataFlowGraphvizGenerator(mod, visitor)
-                dot_source = visitor.transform("decode")
-                with open("llama.dot", "w") as f:
-                    f.write(dot_source)
-
-                src = graphviz.Source(dot_source)
-                src.render(filename="llama", format="pdf")
-                import ipdb; ipdb.set_trace()
+                dump_graph("llama_pre_transform", mod, func="decode")
 
             mod = mod_transform_before_build(mod, params, ARGS)
             # print(mod.without_attr("external_mods").without_attr("const_name_to_constant"))
