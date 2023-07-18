@@ -5,6 +5,7 @@ import torch.distributed as dist
 import torch.utils.dlpack
 import tvm
 from tvm.script import tir as T
+from tvm._ffi import register_func
 
 
 def generate_matmul(M, N, K):
@@ -95,6 +96,72 @@ def test_matmul_all_gather(rank, world_size):
     output = torch.cat(tensor_list, dim=last_dim).contiguous()
     print(f'Rank {rank} has tensor:\n {output}\nShape:{output.shape}\n')
 
+
+def generate_weight_stationary_distributed_matmul(M, N, K, rank, world_size, split_mode="spatial"):
+    if split_mode == "spatial":
+        N_per_rank = N//world_size
+        K_per_rank = K
+    elif split_mode == "reduce":
+        N_per_rank = N
+        K_per_rank = K//world_size
+        needs_scatter_ = 1
+    else:
+        raise ValueError("Unsupported split mode used")
+    
+    @T.prim_func
+    def tir_matmul(a: T.handle, b: T.handle, c: T.handle) -> None:
+        T.func_attr({"global_symbol": "main", "tir.noalias": True})
+        A = T.match_buffer(a, (M, K), dtype="float32")
+        B = T.match_buffer(b, (N_per_rank, K_per_rank), dtype="float32")
+        C = T.match_buffer(c, (M, N), dtype="float32")
+        A_per_rank = T.alloc_buffer((M, K_per_rank), dtype="float32")
+        C_per_rank = T.alloc_buffer((M, N_per_rank), dtype="float32")
+        
+        if needs_scatter_:
+            T.tvm_call_packed("torch.distributed.collective.scatter", rank, world_size, A, A_per_rank)
+
+        for i0, j0, k0 in T.grid(M, N_per_rank, K_per_rank):
+            with T.block("matmul"):
+                i, j, k = T.axis.remap("SSR", [i0, j0, k0])
+                with T.init():
+                    C_per_rank[i, j] = 0.0
+                C_per_rank[i, j] += A[i, k] * B[j, k]
+        
+        T.tvm_call_packed("torch.distributed.collective", split_mode, rank, world_size, C_per_rank, C)
+        
+                
+    return tir_matmul
+
+@tvm.register_func("tvm.torch.distributed.collective")
+def torch_dist_collective_comm(split_mode: str, rank: int, world_size: int, C_per_rank, C):
+    import ipdb; ipdb.set_trace()
+
+
+def test_matmul_all_reduce(rank, world_size):
+    # Initialize the torch.distributed process group
+    dist.init_process_group(backend='nccl')
+    torch.cuda.set_device(rank)
+
+    # Compile the matrix multiply layer and split weights among
+    # the individual process ranks and attached GPU
+    target = tvm.target.Target("cuda")
+    M, N, K = (128, 128, 128)
+    sch = tvm.tir.Schedule(generate_weight_stationary_distributed_matmul(M, N, K, rank, world_size, "reduce"))
+    matmul_block = sch.get_block("matmul")
+    i, j, _ = sch.get_loops(matmul_block)
+    sch.bind(j, "blockIdx.x")
+    sch.bind(i, "threadIdx.x")
+    mod = tvm.build(sch.mod, target=target)
+    act_shape = (M, K)
+    wgt_shape = (N, K//world_size)
+    out_shape = (M, N)
+    dev = tvm.cuda(rank)
+    act_np = np.ones(act_shape, dtype="float32")
+    wgt_np = np.ones(wgt_shape, dtype="float32")
+    act = tvm.nd.array(act_np, device=dev)
+    wgt = tvm.nd.array(wgt_np, device=dev)
+    out = tvm.nd.empty(out_shape, device=dev)
+    mod(act, wgt, out)
         
 def main():
     rank = int(os.environ['LOCAL_RANK'])
