@@ -144,7 +144,7 @@ async def request_completion(request: CompletionRequest):
     Creates a completion for a given prompt.
     """
     session["chat_mod"].reset_chat()
-    prompt = request.prompt[0]
+    prompt = request.prompt
     session["chat_mod"].prefill(input=prompt)
 
     msg = None
@@ -155,7 +155,8 @@ async def request_completion(request: CompletionRequest):
         choices=[
             CompletionResponseChoice(
                 index=0,
-                text=msg
+                text=msg,
+                finish_reason="stop"
             )
         ],
         # TODO: Fill in correct usage info
