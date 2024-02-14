@@ -103,6 +103,6 @@ QUANTIZATION: Dict[str, Quantization] = {
         quantize_dtype="e4m3_float8",
         storage_dtype="uint32",
         model_dtype="float16",
-        linear_weight_layout="NK",  # TODO: should be transpose?
+        linear_weight_layout="NK",
     ),
 }

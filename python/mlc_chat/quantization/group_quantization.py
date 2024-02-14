@@ -15,7 +15,7 @@ from mlc_chat.nn import MixtralExperts
 from mlc_chat.support import logging
 from mlc_chat.support import tensor_parallel as tp
 
-from .utils import convert_uint_to_float
+from .utils import convert_uint_to_float, quant_and_pack_fp8x4_e4m3_sm90, dequant_fp8x4_e4m3_sm90
 
 logger = logging.getLogger(__name__)
 
@@ -182,30 +182,35 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
         out_shape: Optional[List[tir.PrimExpr]] = None,
     ):
         tir_max_int = tir.const(self.max_int_value, self.model_dtype)
-        float_weight = convert_uint_to_float(
-            weight,
-            DataType(self.quantize_dtype).bits,
-            self.num_elem_per_storage,
-            self.storage_dtype,
-            self.model_dtype,
-            axis=axis,
-            out_shape=out_shape,
-        )
+
         if out_shape is None:
             out_shape = weight.shape
             out_shape[axis] *= self.num_elem_per_storage
         axis = axis if axis >= 0 else len(out_shape) + axis
-        return te.compute(
-            shape=out_shape,
-            fcompute=lambda *idx: tir.multiply(
-                tir.subtract(
-                    float_weight(*idx),
-                    tir_max_int,  # TODO(jmcmahan): the max_int shift to remove negatives is not necessary for fp8
-                ),
-                scale(*idx[:axis], idx[axis] // self.group_size, *idx[axis + 1 :]),
+
+        dequant = te.extern_primfunc(
+            [weight, scale],
+            dequant_fp8x4_e4m3_sm90(
+                weight.shape,
+                scale.shape,
+                out_shape,
+                self.group_size,
+                axis,
+                self.model_dtype,
+                self.storage_dtype,
+                self.quantize_dtype,
             ),
+            dtype=self.model_dtype,
             name="dequantize",
         )
+
+        # f = te.create_prim_func([weight, scale, dequant])
+        # f.show()
+        # import ipdb
+
+        # ipdb.set_trace()
+
+        return dequant
 
     def quantize_weight(
         self, weight: NDArray, axis: int = -1, output_transpose: bool = False
@@ -232,7 +237,7 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
         device = weight.device
         device_type = device.MASK2STR[device.device_type]
         axis = axis if axis >= 0 else len(weight.shape) + axis
-        
+
         def _create_quantize_func() -> IRModule:
             if self.fp8_quant:
                 if DataType(self.quantize_dtype).type_code == DataTypeCode.E4M3Float:
@@ -241,7 +246,7 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
                     assert NotImplementedError()
             else:
                 quantize_func = self._quantize
-            
+
             bb = relax.BlockBuilder()  # pylint: disable=invalid-name
             weight_var = relax.Var("weight", relax.TensorStructInfo(weight.shape, weight.dtype))
             with bb.function(name="main", params=[weight_var]):
@@ -400,42 +405,22 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
         # compute scaled weight
         # TODO(fp8-team): Convince ourselves that we don't need to clip the quantized weight
         # Need a cast to FP8, then reinerpret cast
-        scaled_weight = te.compute(
-            shape=weight.shape,
-            fcompute=lambda *idx: tir.reinterpret(
-                # TODO(csullivan) Change this to a vector type to simplify storage and improving casting
+        quantized_weight = te.extern_primfunc(
+            [weight, scale],
+            quant_and_pack_fp8x4_e4m3_sm90(
+                weight.shape,
+                scale_shape,
+                self.group_size,
+                axis,
+                self.model_dtype,
                 self.storage_dtype,
-                tir.Cast(
-                    self.quantize_dtype,
-                    weight(*idx)
-                    / scale(*idx[:axis], idx[axis] // self.group_size, *idx[axis + 1 :]),
-                ),
+                self.quantize_dtype,
             ),
+            name="quantized_weight",
         )
 
-        # TODO(csullivan): If using vector type fp8x4 this compute op can be deleted
-        # compute quantized weight per storage
-        r = te.reduce_axis((0, self.num_elem_per_storage), name="r")  # pylint: disable=invalid-name
-        num_storage = self.num_storage_per_group * num_group
-        quantized_weight_shape = (*shape[:axis], num_storage, *shape[axis + 1 :])
-        quantized_weight = te.compute(
-            shape=quantized_weight_shape,
-            fcompute=lambda *idx: tir.sum(
-                tir.if_then_else(
-                    idx[axis] * self.num_elem_per_storage + r < k,
-                    scaled_weight(
-                        *idx[:axis], idx[axis] * self.num_elem_per_storage + r, *idx[axis + 1 :]
-                    )
-                    << (r * quantize_dtype.bits),
-                    0,
-                ),
-                axis=r,
-            ),
-            name="weight",
-        )
-
-        # f = te.create_prim_func([weight, max_abs, scaled_weight, scale, quantized_weight])
-        # f.show()
+        f = te.create_prim_func([weight, max_abs, scale, quantized_weight])
+        f.show()
         # import ipdb
 
         # ipdb.set_trace()
@@ -552,7 +537,7 @@ class GroupQuantizeLinear(nn.Module):  # pylint: disable=too-many-instance-attri
                     tir.IntImm("int64", self.in_features),
                 ]
                 if self.config.linear_weight_layout == "NK"
-                else [
+                else [  # KN case
                     tir.IntImm("int64", self.in_features),
                     tir.IntImm("int64", self.out_features)
                     if isinstance(self.out_features, int)

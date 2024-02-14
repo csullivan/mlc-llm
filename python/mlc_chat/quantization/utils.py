@@ -2,6 +2,7 @@
 from typing import List, Optional
 
 from tvm import te, tir
+from tvm.script import tir as T
 
 
 def convert_uint_to_float(  # pylint: disable=too-many-arguments
@@ -38,3 +39,92 @@ def convert_uint_to_float(  # pylint: disable=too-many-arguments
             tir_bin_mask,
         ).astype(model_dtype),
     )
+
+
+def quant_and_pack_fp8x4_e4m3_sm90(
+    weight_shape, scale_shape, group_size, axis, model_dtype, storage_dtype, quantized_dtype
+):
+    vector_length = 4
+    vec_quantized_dtype = f"{quantized_dtype}x{vector_length}"
+    vec_model_dtype = f"{model_dtype}x{vector_length}"
+    num_elem_per_storage = vector_length
+    assert (
+        group_size % vector_length == 0
+    ), f"Number of elements in a group must be divisible by fp8 vector length {vector_length}"
+
+    @T.prim_func
+    def quant_pack(
+        A: T.Buffer(weight_shape, model_dtype),
+        scale: T.Buffer(scale_shape, model_dtype),
+        compute: T.Buffer(
+            (T.int64(weight_shape[0]), T.int64(weight_shape[1] // num_elem_per_storage)),
+            storage_dtype,
+        ),
+    ):
+        T.func_attr({"tir.noalias": T.bool(True)})
+        # with T.block("root"):
+        # test = T.alloc_buffer(1, dtype=vec_model_dtype, scope="local")
+        for i0, i1 in T.grid(T.int64(weight_shape[0]), T.int64(weight_shape[1])):
+            with T.block("compute"):
+                v_i0 = T.axis.spatial(T.int64(weight_shape[0]), i0)
+                v_i1 = T.axis.spatial(T.int64(weight_shape[1] // vector_length), i1)
+                T.reads(
+                    A[v_i0, v_i1 : v_i1 + vector_length],
+                    scale[v_i0, v_i1 * T.int64(vector_length) // T.int64(group_size)],
+                )
+                T.writes(compute[v_i0, v_i1 * vector_length])
+                compute[v_i0, v_i1 * vector_length] = T.reinterpret(
+                    storage_dtype,
+                    T.Cast(
+                        vec_quantized_dtype,
+                        # Note: Using the colon here is a sugared way of writing T.ramp(v_i1, 1, vector_length)
+                        # ie a vector load of A
+                        A[v_i0, v_i1 : v_i1 + vector_length]
+                        / scale[v_i0, v_i1 * T.int64(vector_length) // T.int64(group_size)],
+                    ),
+                )
+
+    return quant_pack
+
+
+def dequant_fp8x4_e4m3_sm90(
+    packed_weight_shape,
+    scale_shape,
+    out_shape,
+    group_size,
+    axis,
+    model_dtype,
+    storage_dtype,
+    quantized_dtype,
+):
+    vector_length = 4
+    vec_quantized_dtype = f"{quantized_dtype}x{vector_length}"
+    vec_model_dtype = f"{model_dtype}x{vector_length}"
+    num_elem_per_storage = vector_length
+
+    @T.prim_func
+    def dequant(
+        packed_weight: T.Buffer(packed_weight_shape, storage_dtype),
+        scale: T.Buffer(scale_shape, model_dtype),
+        dequantize: T.Buffer(out_shape, model_dtype),
+    ):
+        T.func_attr({"tir.noalias": T.bool(True)})
+        # with T.block("root"):
+        for i0, i1 in T.grid(T.int64(packed_weight_shape[0]), T.int64(packed_weight_shape[1])):
+            with T.block("dequantize"):
+                v_i0 = T.axis.spatial(T.int64(packed_weight_shape[0]), i0)
+                v_i1 = T.axis.spatial(T.int64(packed_weight_shape[1]), i1)
+                T.reads(
+                    packed_weight[v_i0, v_i1],
+                    scale[v_i0, v_i1 * T.int64(vector_length) // T.int64(group_size)],
+                )
+                T.writes(dequantize[v_i0, v_i1 : v_i1 + vector_length])
+                dequantize[v_i0, v_i1 : v_i1 + vector_length] = T.Cast(
+                    vec_model_dtype, T.reinterpret(vec_quantized_dtype, packed_weight[v_i0, v_i1])
+                ) * T.Broadcast(
+                    scale[v_i0, v_i1 * T.int64(vector_length) // T.int64(group_size)], vector_length
+                )
+
+    dequant.show()
+
+    return dequant
