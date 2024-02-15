@@ -238,23 +238,44 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
         device_type = device.MASK2STR[device.device_type]
         axis = axis if axis >= 0 else len(weight.shape) + axis
 
-        def _create_quantize_func() -> IRModule:
-            if self.fp8_quant:
+        if self.fp8_quant:
+
+            def _create_quantize_func() -> IRModule:
                 if DataType(self.quantize_dtype).type_code == DataTypeCode.E4M3Float:
                     quantize_func = self._quantize_e4m3
                 else:
                     assert NotImplementedError()
-            else:
-                quantize_func = self._quantize
 
-            bb = relax.BlockBuilder()  # pylint: disable=invalid-name
-            weight_var = relax.Var("weight", relax.TensorStructInfo(weight.shape, weight.dtype))
-            with bb.function(name="main", params=[weight_var]):
-                with bb.dataflow():
-                    lv = bb.emit_te(quantize_func, weight_var, axis, output_transpose)
-                    gv = bb.emit_output(lv)  # pylint: disable=invalid-name
-                bb.emit_func_output(gv)
-            return bb.finalize()
+                bb = relax.BlockBuilder()  # pylint: disable=invalid-name
+                weight_var = relax.Var("weight", relax.TensorStructInfo(weight.shape, weight.dtype))
+                compute_scale, compute_quantize, compute_transpose = quantize_func(
+                    weight.shape, axis, output_transpose
+                )
+                with bb.function(name="main", params=[weight_var]):
+                    with bb.dataflow():
+                        lv_scale = bb.emit_te(compute_scale, weight_var)
+                        lv_quantized_weight = compute_quantize(bb, (weight_var, lv_scale))
+                        if compute_transpose:
+                            lv_output = bb.emit_te(compute_transpose, lv_quantized_weight, lv_scale)
+                            lv_quantized_weight = lv_output[0]
+                            lv_scale = lv_output[1]
+                        tuple_output = bb.emit((lv_quantized_weight, lv_scale))
+                        gv = bb.emit_output(tuple_output)
+                    bb.emit_func_output(gv)
+                return bb.finalize()
+
+        else:
+
+            def _create_quantize_func() -> IRModule:
+                quantize_func = self._quantize
+                bb = relax.BlockBuilder()  # pylint: disable=invalid-name
+                weight_var = relax.Var("weight", relax.TensorStructInfo(weight.shape, weight.dtype))
+                with bb.function(name="main", params=[weight_var]):
+                    with bb.dataflow():
+                        lv = bb.emit_te(quantize_func, weight_var, axis, output_transpose)
+                        gv = bb.emit_output(lv)  # pylint: disable=invalid-name
+                    bb.emit_func_output(gv)
+                return bb.finalize()
 
         def _compile_quantize_func(mod: IRModule) -> Callable:
             if device_type in ["cuda", "rocm", "metal", "vulkan"]:
@@ -365,13 +386,13 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
 
     def _quantize_e4m3(  # pylint: disable=too-many-locals
         self,
-        weight: te.Tensor,
+        weight_shape: List[tir.PrimExpr],
         axis: int = -1,
         output_transpose: bool = False,
     ) -> Tuple[te.Tensor, te.Tensor]:
         """Group quantization for weight tensor, defined in tensor expression."""
         max_int = tir.const(self.max_int_value, self.model_dtype)
-        shape = weight.shape  # pylint: disable=invalid-name
+        shape = weight_shape  # pylint: disable=invalid-name
         axis = axis if axis >= 0 else len(shape) + axis
         k = shape[axis]
         quantize_dtype = DataType(self.quantize_dtype)
@@ -382,57 +403,71 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
         # for channel quant group_size = 4096 -> (1, 4096)
         scale_shape = (*shape[:axis], num_group, *shape[axis + 1 :])
 
-        min_scaling_factor = tir.const(1.0 / (self.max_int_value * 512.0), self.model_dtype)
-        max_abs = te.compute(
-            shape=scale_shape,
-            fcompute=lambda *idx: te.max(
-                tir.if_then_else(
-                    idx[axis] * self.group_size + r < k,
-                    te.abs(weight(*idx[:axis], idx[axis] * self.group_size + r, *idx[axis + 1 :])),
-                    te.min_value(self.model_dtype),
+        def compute_scale(weight: te.Tensor):
+            min_scaling_factor = tir.const(1.0 / (self.max_int_value * 512.0), self.model_dtype)
+            max_abs = te.compute(
+                shape=scale_shape,
+                fcompute=lambda *idx: te.max(
+                    tir.if_then_else(
+                        idx[axis] * self.group_size + r < k,
+                        te.abs(
+                            weight(*idx[:axis], idx[axis] * self.group_size + r, *idx[axis + 1 :])
+                        ),
+                        te.min_value(self.model_dtype),
+                    ),
+                    axis=r,
                 ),
-                axis=r,
-            ),
-            name="max_abs_value",
-        )
-        scale = te.compute(
-            scale_shape,
-            lambda *idx: te.max(
-                max_abs(*idx).astype(self.model_dtype) / max_int, min_scaling_factor
-            ),
-            name="scale",
-        )
-        # compute scaled weight
-        # TODO(fp8-team): Convince ourselves that we don't need to clip the quantized weight
-        # Need a cast to FP8, then reinerpret cast
-        quantized_weight = te.extern_primfunc(
-            [weight, scale],
-            quant_and_pack_fp8x4_e4m3_sm90(
-                weight.shape,
+                name="max_abs_value",
+            )
+            scale = te.compute(
+                scale_shape,
+                lambda *idx: te.max(
+                    max_abs(*idx).astype(self.model_dtype) / max_int, min_scaling_factor
+                ),
+                name="scale",
+            )
+            return scale
+
+        def compute_quantize_weight(bb: relax.BlockBuilder, args: relax.expr.Expr):
+            # compute scaled weight
+            packed_shape = (weight_shape[0], weight_shape[1] // self.num_elem_per_storage)
+            quant = quant_and_pack_fp8x4_e4m3_sm90(
+                weight_shape,
+                packed_shape,
                 scale_shape,
                 self.group_size,
                 axis,
                 self.model_dtype,
                 self.storage_dtype,
                 self.quantize_dtype,
-            ),
-            name="quantized_weight",
-        )
+            )
+            # quant.show()
+            # import ipdb
 
-        f = te.create_prim_func([weight, max_abs, scale, quantized_weight])
-        f.show()
-        # import ipdb
+            # ipdb.set_trace()
 
-        # ipdb.set_trace()
-
-        if output_transpose:
-            if len(quantized_weight.shape) != 2 or len(scale.shape) != 2:
-                raise ValueError(
-                    "Does not support transpose output quantized weight with ndim != 2"
+            global_var = bb.add_func(quant, "quantized_weight")
+            lv_quantized_weight = bb.emit(
+                relax.call_tir(
+                    global_var, args, relax.TensorStructInfo(packed_shape, self.storage_dtype)
                 )
-            quantized_weight = topi.transpose(quantized_weight)
-            scale = topi.transpose(scale)
-        return quantized_weight, scale
+            )
+            return lv_quantized_weight
+
+        compute_transpose = None
+        if output_transpose:
+
+            def compute_transpose(quantized_weight: te.Tensor, scale: te.Tensor):
+                if len(quantized_weight.shape) != 2 or len(scale.shape) != 2:
+                    raise ValueError(
+                        "Does not support transpose output quantized weight with ndim != 2"
+                    )
+
+                quantized_weight = topi.transpose(quantized_weight)
+                scale = topi.transpose(scale)
+                return quantized_weight, scale
+
+        return compute_scale, compute_quantize_weight, compute_transpose
 
 
 class GroupQuantizeLinear(nn.Module):  # pylint: disable=too-many-instance-attributes
