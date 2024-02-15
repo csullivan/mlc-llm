@@ -176,8 +176,8 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
 
     def _dequantize_e4m3(
         self,
-        weight: te.Tensor,
-        scale: te.Tensor,
+        weight: nn.Tensor,
+        scale: nn.Tensor,
         axis: int,
         out_shape: Optional[List[tir.PrimExpr]] = None,
     ):
@@ -188,29 +188,25 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
             out_shape[axis] *= self.num_elem_per_storage
         axis = axis if axis >= 0 else len(out_shape) + axis
 
-        dequant = te.extern_primfunc(
-            [weight, scale],
-            dequant_fp8x4_e4m3_sm90(
-                weight.shape,
-                scale.shape,
-                out_shape,
-                self.group_size,
-                axis,
-                self.model_dtype,
-                self.storage_dtype,
-                self.quantize_dtype,
-            ),
-            dtype=self.model_dtype,
-            name="dequantize",
+        _func = dequant_fp8x4_e4m3_sm90(
+            weight.shape,
+            scale.shape,
+            out_shape,
+            self.group_size,
+            axis,
+            self.model_dtype,
+            self.storage_dtype,
+            self.quantize_dtype,
         )
 
-        # f = te.create_prim_func([weight, scale, dequant])
-        # f.show()
-        # import ipdb
+        w = nn.op.tensor_ir_op(
+            _func,
+            name_hint="dequantize",
+            args=[weight, scale],
+            out=nn.Tensor.placeholder(out_shape, self.model_dtype),
+        )
 
-        # ipdb.set_trace()
-
-        return dequant
+        return w
 
     def quantize_weight(
         self, weight: NDArray, axis: int = -1, output_transpose: bool = False
@@ -553,35 +549,43 @@ class GroupQuantizeLinear(nn.Module):  # pylint: disable=too-many-instance-attri
         ret : nn.Tensor
             The output tensor for the group quantized linear layer.
         """
+        if self.config.linear_weight_layout == "NK":
+            out_shape = [
+                tir.IntImm("int64", self.out_features)
+                if isinstance(self.out_features, int)
+                else self.q_weight.shape[
+                    0
+                ],  # Reuse same tir.Var for symbolic shape (after Exporter)
+                tir.IntImm("int64", self.in_features),
+            ]
+        else:  # KN case
+            out_shape = [
+                tir.IntImm("int64", self.in_features),
+                tir.IntImm("int64", self.out_features)
+                if isinstance(self.out_features, int)
+                else self.q_weight.shape[
+                    1
+                ],  # Reuse same tir.Var for symbolic shape (after Exporter)
+            ]
+
         if self.config.fp8_quant:
             if DataType(self.config.quantize_dtype).type_code == DataTypeCode.E4M3Float:
                 dequant_func = self.config._dequantize_e4m3
             else:
                 raise NotImplementedError()
+            w = dequant_func(self.q_weight, self.q_scale, axis=-1, out_shape=out_shape)
         else:
-            dequant_func = self.confg._dequantize
-        w = nn.op.tensor_expr_op(  # pylint: disable=invalid-name
-            lambda weight, scale: dequant_func(  # pylint: disable=protected-access
-                weight,
-                scale,
-                axis=self.config.linear_quant_axis,
-                out_shape=[
-                    tir.IntImm("int64", self.out_features)
-                    if isinstance(self.out_features, int)
-                    else weight.shape[0],  # Reuse same tir.Var for symbolic shape (after Exporter)
-                    tir.IntImm("int64", self.in_features),
-                ]
-                if self.config.linear_weight_layout == "NK"
-                else [  # KN case
-                    tir.IntImm("int64", self.in_features),
-                    tir.IntImm("int64", self.out_features)
-                    if isinstance(self.out_features, int)
-                    else weight.shape[1],  # Reuse same tir.Var for symbolic shape (after Exporter)
-                ],
-            ),
-            name_hint="dequantize",
-            args=[self.q_weight, self.q_scale],
-        )
+            dequant_func = self.config._dequantize
+            w = nn.op.tensor_expr_op(  # pylint: disable=invalid-name
+                lambda weight, scale: dequant_func(  # pylint: disable=protected-access
+                    weight,
+                    scale,
+                    axis=self.config.linear_quant_axis,
+                    out_shape=out_shape,
+                ),
+                name_hint="dequantize",
+                args=[self.q_weight, self.q_scale],
+            )
         if self.config.linear_weight_layout == "NK":
             w = nn.op.permute_dims(w)  # pylint: disable=invalid-name
         x = nn.op.matmul(x, w, out_dtype=self.out_dtype)
@@ -655,23 +659,27 @@ class GroupQuantizeEmbedding(nn.Module):
                 dequant_func = self.config._dequantize_e4m3
             else:
                 raise NotImplementedError()
+
+            w = dequant_func(self.q_weight, self.q_scale, axis=-1)
         else:
-            dequant_func = self.confg._dequantize
-        w = nn.op.tensor_expr_op(  # pylint: disable=invalid-name
-            lambda weight, scale: dequant_func(  # pylint: disable=protected-access
-                weight,
-                scale,
-                axis=-1,
-                out_shape=[
-                    tir.IntImm("int64", self.num)
-                    if isinstance(self.num, int)
-                    else weight.shape[0],  # Reuse same tir.Var for symbolic shape (after Exporter)
-                    tir.IntImm("int64", self.dim),
-                ],
-            ),
-            name_hint="dequantize",
-            args=[self.q_weight, self.q_scale],
-        )
+            dequant_func = self.config._dequantize
+            w = nn.op.tensor_expr_op(  # pylint: disable=invalid-name
+                lambda weight, scale: dequant_func(  # pylint: disable=protected-access
+                    weight,
+                    scale,
+                    axis=-1,
+                    out_shape=[
+                        tir.IntImm("int64", self.num)
+                        if isinstance(self.num, int)
+                        else weight.shape[
+                            0
+                        ],  # Reuse same tir.Var for symbolic shape (after Exporter)
+                        tir.IntImm("int64", self.dim),
+                    ],
+                ),
+                name_hint="dequantize",
+                args=[self.q_weight, self.q_scale],
+            )
         if x.ndim == 1:
             return nn.op.take(w, x, axis=0)
         return nn.op.reshape(
